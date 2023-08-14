@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+from PyQt6.QtWidgets import QWidget
+from vspreview.core import Frame, PushButton, VBoxLayout, HBoxLayout
+from vspreview.plugins import MappedNodesPlugin, PluginConfig, PluginGraphicsView
+from vstools import vs
+import os
+import random
+import functools
+
+__all__ = ['MrBeastifyPlugin']
+
+
+class MrBeastifyPlugin(MappedNodesPlugin, QWidget):
+    _config = PluginConfig('store.mrbeast', 'MrBeastify')
+
+    def setup_ui(self) -> None:
+        self.view = PluginGraphicsView(self)
+        self.view._autofit = True
+        self.old_outputs = {}
+
+        clipboard = PushButton("Copy", self, clicked=self.clipboard)
+        replace = PushButton("Replace", self, clicked=self.replace)
+        replace_all = PushButton("Replace All", self, clicked=self.replace_all)
+        restore = PushButton("Restore", self, clicked=self.restore)
+        restore_all = PushButton("Restore All", self, clicked=self.restore_all)
+
+        hbox = HBoxLayout(
+            None, [clipboard, replace, replace_all, restore, restore_all])
+        VBoxLayout(self, [hbox, self.view])
+
+    def clipboard(self):
+        self.main.clipboard.setPixmap(self.view.current_scene.pixmap())
+
+    def replace(self):
+        index = self.main.outputs.index_of(self.main.current_output)
+        if index in self.old_outputs: return
+
+        self.old_outputs[index] = self.main.outputs[index]
+        new_node = self.outputs.prepared
+        self.main.outputs.items[index] = self.main.outputs[index].with_node(
+            new_node)
+
+        self.main.switch_frame(self.main.current_output.last_showed_frame)
+
+    def replace_all(self):
+        for index, output in enumerate(self.main.outputs):
+            self.old_outputs[index] = self.main.outputs[index]
+            new_node = self.outputs[self.main.outputs[index]].prepared
+            self.main.outputs.items[index] = self.main.outputs[
+                index].with_node(new_node)
+
+        self.main.switch_frame(self.main.current_output.last_showed_frame)
+
+    def restore(self):
+        index = self.main.outputs.index_of(self.main.current_output)
+        if index not in self.old_outputs: return
+
+        frame = self.main.current_output.last_showed_frame
+        self.main.outputs.items[index] = self.old_outputs[index]
+        del self.old_outputs[index]
+
+        self.main.switch_frame(frame)
+
+    def restore_all(self):
+        frame = self.main.current_output.last_showed_frame
+
+        for index in list(self.old_outputs.keys()):
+            self.main.outputs.items[index] = self.old_outputs[index]
+            del self.old_outputs[index]
+
+        self.main.switch_frame(frame)
+
+    def get_node(self, node: vs.VideoNode) -> vs.VideoNode:
+        if node.format.id == vs.GRAY32: return node
+
+        imdir = os.path.join(os.path.dirname(__file__), "images")
+        images = vs.core.imwri.Read(os.path.join(imdir, "%d.png"),
+                                    firstnum=1,
+                                    alpha=True)
+        images = vs.core.resize.Bicubic(images,
+                                        node.width,
+                                        node.height,
+                                        format=vs.YUV444P16,
+                                        matrix_s="709")
+
+        alpha = vs.core.std.PropToClip(images, "_Alpha")
+        alpha = vs.core.resize.Bicubic(alpha,
+                                       node.width,
+                                       node.height,
+                                       format=vs.GRAY16)
+
+        c = [random.randint(0, len(images) - 1) for i in range(len(node) // 4)]
+
+        node = vs.core.resize.Bicubic(node,
+                                      format=vs.YUV444P16,
+                                      matrix_s="709")
+
+        def beastify(n, clip):
+            v = images[c[n // 4]]
+            a = alpha[c[n // 4]]
+            return vs.core.std.MaskedMerge(clip, v, a)
+
+        return vs.core.std.FrameEval(node,
+                                     functools.partial(beastify, clip=node))
+
+    def on_current_frame_changed(self, frame: Frame) -> None:
+        frame = self.outputs.current.to_frame(
+            self.main.current_output.to_time(frame))
+        self.outputs.current.render_frame(frame, None, None,
+                                          self.view.current_scene)
+
+    def on_current_output_changed(self, cur, prev):
+        self.on_current_frame_changed(
+            self.main.current_output.last_showed_frame)
+
+    def init_outputs(self) -> None:
+        assert self.main.outputs
+        self.outputs.clear()
+        self.old_outputs.clear()
