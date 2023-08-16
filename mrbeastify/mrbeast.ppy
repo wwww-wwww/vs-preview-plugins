@@ -90,7 +90,9 @@ class MrBeastifyPlugin(MappedNodesPlugin, QWidget):
                                        node.height,
                                        format=vs.GRAY16)
 
-        c = [random.randint(0, len(images) - 1) for i in range(len(node) // 4)]
+        nframes = max(len(node) // 4, 1)
+
+        c = [random.randint(0, len(images) - 1) for i in range(nframes)]
 
         node = vs.core.resize.Bicubic(node,
                                       format=vs.YUV444P16,
