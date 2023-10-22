@@ -1,0 +1,269 @@
+from __future__ import annotations
+
+from PyQt6.QtWidgets import QWidget
+from vspreview.core import Frame, PushButton, VBoxLayout, HBoxLayout
+from vspreview.plugins import MappedNodesPlugin, PluginConfig, PluginGraphicsView
+from vstools import vs
+
+from tqdm import tqdm
+import math
+import cv2
+import numpy as np
+
+core = vs.core
+
+__all__ = ['UndermixPlugin']
+
+
+class UndermixPlugin(MappedNodesPlugin, QWidget):
+  _config = PluginConfig('moe.grass', 'undermix')
+  _autofit = True
+
+  def setup_ui(self) -> None:
+    self.view = PluginGraphicsView(self)
+    analyze = PushButton("Analyze", self, clicked=self.analyze)
+
+    hbox = HBoxLayout(None, [analyze])
+    VBoxLayout(self, [hbox, self.view])
+
+    self.features = {}
+    self.transforms = {}
+    self.offsets_xy = {}
+    self.width = None
+    self.height = None
+
+  def get_features(self, f, n):
+    if n in self.features:
+      return self.features[n]
+    orb = cv2.ORB_create(500)
+    gray = np.ctypeslib.as_array(f).reshape((1080, 1920)).copy(order="C")
+    self.features[n] = orb.detectAndCompute(gray, None)
+    return self.features[n]
+
+  def get_node(self, node):
+    if node.format.id == vs.GRAY32: return node
+
+    gray = core.resize.Bicubic(node, format=vs.GRAY8, matrix_s="709")
+    gray = core.std.RemoveFrameProps(gray, "_Matrix")
+    gray = core.std.Sobel(gray)
+
+    def points(n, f):
+      im = np.ctypeslib.asarray(f[0]).swapaxes(0, 2).swapaxes(0, 1)
+      im = im.copy(order="C")
+
+      kp, des = self.get_features(f[1], n)
+      im = cv2.drawKeypoints(im, kp, None, color=(255, 0, 0), flags=0)
+
+      f = f[0].copy()
+      np.copyto(np.asarray(f[0]), im[:, :, 0])
+      np.copyto(np.asarray(f[1]), im[:, :, 1])
+      np.copyto(np.asarray(f[2]), im[:, :, 2])
+      return f
+
+    node = core.resize.Bicubic(node, format=vs.RGB24, matrix_in_s="709")
+
+    if self.width == None:
+      node = core.std.ModifyFrame(clips=[node, gray],
+                                  clip=node,
+                                  selector=points)
+      return node
+
+    resized = core.resize.Bicubic(node, width=self.width, height=self.height)
+
+    print("rotate")
+
+    def rotate(n, f):
+      if n not in self.transforms:
+        return f[1]
+
+      im = np.ctypeslib.asarray(f[0]).swapaxes(0, 2).swapaxes(0, 1)
+      im = im.copy(order="C")
+
+      kp, des = self.features[n]
+      im = cv2.drawKeypoints(im, kp, None, color=(255, 0, 0), flags=0)
+
+      (warp_matrix, size) = self.transforms[n]
+
+      im = cv2.warpAffine(im,
+                          warp_matrix,
+                          size,
+                          flags=cv2.INTER_CUBIC + cv2.WARP_INVERSE_MAP,
+                          borderMode=cv2.BORDER_REPLICATE).astype(np.uint8)
+
+      #mask_im = im.copy()
+      #mask_im[:2, :, 3] = 0
+      #mask_im[-2:, :, 3] = 0
+      #mask_im[:, :2, 3] = 0
+      #mask_im[:, -2:, 3] = 0
+      #mask = cv2.warpAffine(mask_im,
+      #                      warp_matrix,
+      #                      size,
+      #                      flags=cv2.INTER_CUBIC + cv2.WARP_INVERSE_MAP)
+      #im[:, :, 3] = mask[:, :, 3]
+
+      im2 = np.zeros((f[1].height, f[1].width, 3), np.uint8)
+
+      y, x = self.offsets_xy[n]
+      y = int(round(y))
+      x = int(round(x))
+      im2[x:x + im.shape[0], y:y + im.shape[1]] = im[:, :]
+
+      f = f[1].copy()
+      np.copyto(np.asarray(f[0]), im2[:, :, 0])
+      np.copyto(np.asarray(f[1]), im2[:, :, 1])
+      np.copyto(np.asarray(f[2]), im2[:, :, 2])
+      return f
+
+    resized = core.std.BlankClip(resized)
+    node = core.std.ModifyFrame(clips=[node, resized],
+                                clip=resized,
+                                selector=rotate)
+
+    return node
+
+  def analyze(self):
+    node = self.main.current_output.prepared.original_clip
+
+    gray = core.resize.Bicubic(node, format=vs.GRAY8, matrix_s="709")
+    gray = core.std.RemoveFrameProps(gray, "_Matrix")
+    gray = core.std.Sobel(gray)
+
+    features = {}
+    warp_matrices = {}
+    offsets = {}
+    warp_matrices_cum = {}
+
+    start = 426
+    end = 492
+
+    for i in tqdm(range(start, end + 1)):
+      f = gray.get_frame(i)
+      self.get_features(f, i)
+
+    # feature matching
+    index_params = dict(
+        algorithm=6,
+        table_number=6,  # 12
+        key_size=12,  # 20
+        multi_probe_level=1)
+    search_params = dict(checks=50)
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    def feature_matching(i1, i2):
+      kp1, des1 = self.features[i1]
+      kp2, des2 = self.features[i2]
+
+      matches2to1 = flann.knnMatch(des2, des1, k=2)
+      recip_matches = flann.knnMatch(des1, des2, k=2)
+
+      matchesMask_ratio = [[0, 0] for i in range(len(matches2to1))]
+      match_dict = {}
+      for i, d in enumerate(matches2to1):
+        if len(d) < 2: continue
+        m, n = d
+
+        if m.distance < 0.7 * n.distance:
+          matchesMask_ratio[i] = [1, 0]
+          match_dict[m.trainIdx] = m.queryIdx
+
+      good = []
+      matchesMask_ratio_recip = [[0, 0] for i in range(len(recip_matches))]
+
+      for i, d in enumerate(recip_matches):
+        if len(d) < 2: continue
+        m, n = d
+        if m.distance < 0.7 * n.distance:  # ratio
+          if m.queryIdx in match_dict and match_dict[
+              m.queryIdx] == m.trainIdx:  #reciprocal
+            good.append(m)
+            matchesMask_ratio_recip[i] = [1, 0]
+
+      return ([kp1[m.queryIdx].pt
+               for m in good], [kp2[m.trainIdx].pt for m in good])
+
+    def get_transform(i1, i2):
+      pts1, pts2 = feature_matching(i1, i2)
+
+      src_pts = np.float32(pts1).reshape(-1, 1, 2)
+      dst_pts = np.float32(pts2).reshape(-1, 1, 2)
+
+      M, mask = cv2.estimateAffinePartial2D(src_pts,
+                                            dst_pts,
+                                            cv2.USAC_MAGSAC,
+                                            ransacReprojThreshold=5.0)
+      return M
+
+    print("transforms")
+    for i in tqdm(range(start, end)):
+      warp_matrices[i] = get_transform(i, i + 1)
+
+    running_total_matrix = np.eye(3, 3, dtype=np.float64)
+
+    sz = (node.height, node.width)
+    print("running total")
+    for i in tqdm(range(start, end)):
+      wm = np.copy(warp_matrices[i])
+
+      tempwarp = np.vstack([wm, np.array([0, 0, 1])])
+      running_total_matrix = tempwarp.dot(running_total_matrix)
+      warp_matrices_cum[i] = running_total_matrix
+
+      warp_matrix = warp_matrices_cum[i][0:2].astype(np.float64)
+      c = np.vstack((warp_matrix, [0, 0, 1]))
+      c_inv = np.linalg.inv(c)[:2]
+
+      points = [[0, 0], [sz[1], 0], [0, sz[0]], [sz[1], sz[0]]]
+      points = [c_inv.dot([p[0], p[1], 1]) for p in points]
+
+      x_min = min([p[0] for p in points])
+      x_max = max([p[0] for p in points])
+      y_min = min([p[1] for p in points])
+      y_max = max([p[1] for p in points])
+
+      left_padding = x_min
+      right_padding = x_max - sz[1]
+      top_padding = y_min
+      bottom_padding = y_max - sz[0]
+
+      offsets[i] = (left_padding, top_padding, x_max, y_max)
+
+      offset_trans = np.eye(3, 3, dtype=np.float64)
+      offset_trans[0, 2] = left_padding
+      offset_trans[1, 2] = top_padding
+      new_warp_matrix = np.vstack([warp_matrix, np.array([0, 0, 1])])
+
+      new_warp_matrix = new_warp_matrix.dot(offset_trans)[:2]
+
+      # (running matrix, (width, height))
+      self.transforms[i] = (new_warp_matrix,
+                            (int(sz[1] + right_padding - left_padding),
+                             int(sz[0] + bottom_padding - top_padding)))
+
+    left = math.floor(round(min([o[0] for o in offsets.values()]), 4))
+    top = math.floor(round(min([o[1] for o in offsets.values()]), 4))
+    right = math.ceil(round(max([o[2] for o in offsets.values()]), 4))
+    bottom = math.ceil(round(max([o[3] for o in offsets.values()]), 4))
+
+    self.width = right - left
+    self.height = bottom - top
+
+    self.offsets_xy = {
+        o: (offsets[o][0] - left, offsets[o][1] - top)
+        for o in offsets
+    }
+
+    self.reset()
+
+  def on_current_frame_changed(self, frame: Frame) -> None:
+    frame = self.outputs.current.to_frame(
+        self.main.current_output.to_time(frame))
+    self.outputs.current.render_frame(frame, None, None,
+                                      self.view.current_scene)
+
+  def on_current_output_changed(self, cur, prev):
+    self.on_current_frame_changed(self.main.current_output.last_showed_frame)
+
+  def init_outputs(self) -> None:
+    assert self.main.outputs
+    self.outputs.clear()
