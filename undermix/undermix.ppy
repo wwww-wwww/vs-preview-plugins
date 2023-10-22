@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QWidget
-from vspreview.core import Frame, PushButton, VBoxLayout, HBoxLayout
+from PyQt6.QtWidgets import QWidget, QSizePolicy
+from vspreview.core import Frame, PushButton, VBoxLayout, HBoxLayout, SpinBox, ProgressBar, LineEdit
+from vspreview.core.custom import ComboBox
 from vspreview.plugins import MappedNodesPlugin, PluginConfig, PluginGraphicsView
 from vstools import vs
 
@@ -12,25 +13,66 @@ import numpy as np
 
 core = vs.core
 
-__all__ = ['UndermixPlugin']
+__all__ = ["UndermixPlugin"]
 
 
 class UndermixPlugin(MappedNodesPlugin, QWidget):
-  _config = PluginConfig('moe.grass', 'undermix')
-  _autofit = True
+  _config = PluginConfig("moe.grass", "undermix")
 
   def setup_ui(self) -> None:
     self.view = PluginGraphicsView(self)
+
+    self.start_n = SpinBox(minimum=0)
+    start_set = PushButton("Set", self, clicked=self.set_start)
+    self.end_n = SpinBox(minimum=0)
+    end_set = PushButton("Set", self, clicked=self.set_end)
+
     analyze = PushButton("Analyze", self, clicked=self.analyze)
 
-    hbox = HBoxLayout(None, [analyze])
-    VBoxLayout(self, [hbox, self.view])
+    self.outpath = LineEdit("stitched.png")
+    self.outpath.setSizePolicy(QSizePolicy.Policy.Preferred,
+                               QSizePolicy.Policy.Preferred)
+    self.rendermode = ComboBox()
+    self.rendermode.addItems(["median"])
+    self.rendermode.setCurrentIndex(0)
+    render = PushButton("Render", self, clicked=self.render)
+
+    self.progress = ProgressBar()
+    self.progress.setTextVisible(True)
+
+    hbox = HBoxLayout(None,
+                      [self.start_n, start_set, self.end_n, end_set, analyze])
+    hbox2 = HBoxLayout(None, [self.outpath, self.rendermode, render])
+    VBoxLayout(self, [self.view, self.progress, hbox, hbox2])
 
     self.features = {}
     self.transforms = {}
     self.offsets_xy = {}
     self.width = None
     self.height = None
+
+  def set_start(self):
+    self.start_n.setValue(self.main.current_output.last_showed_frame)
+
+  def set_end(self):
+    self.end_n.setValue(self.main.current_output.last_showed_frame)
+
+  def render(self):
+    node = self.main.current_output.prepared.original_clip
+
+    rendermode = self.rendermode.currentIndex()
+    start = self.start_n.value()
+    end = self.end_n.value()
+    total = end - start
+
+    rotated_images = []
+
+    self.progress.setValue(0)
+    self.progress.setFormat(f"Rotating frames: 0/{total}")
+
+    for i in range(start, end + 1):
+      (warp_matrix, size) = self.transforms[i]
+      self.progress.setFormat(f"Rotating frames: {i - start}/{total}")
 
   def get_features(self, f, n):
     if n in self.features:
@@ -70,8 +112,6 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     resized = core.resize.Bicubic(node, width=self.width, height=self.height)
 
-    print("rotate")
-
     def rotate(n, f):
       if n not in self.transforms:
         return f[1]
@@ -103,10 +143,19 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
       im2 = np.zeros((f[1].height, f[1].width, 3), np.uint8)
 
-      y, x = self.offsets_xy[n]
-      y = int(round(y))
+      x, y = self.offsets_xy[n]
+
       x = int(round(x))
-      im2[x:x + im.shape[0], y:y + im.shape[1]] = im[:, :]
+      y = int(round(y))
+      x2 = x + im.shape[1]
+      y2 = y + im.shape[0]
+
+      x = max(x, 0)
+      y = max(y, 0)
+      x2 = min(x2, f[1].width)
+      y2 = min(y2, f[1].height)
+
+      im2[y:y2, x:x2] = im[:y2 - y, :x2 - x]
 
       f = f[1].copy()
       np.copyto(np.asarray(f[0]), im2[:, :, 0])
@@ -133,12 +182,21 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     offsets = {}
     warp_matrices_cum = {}
 
-    start = 426
-    end = 492
+    start = self.start_n.value()
+    end = self.end_n.value()
+    total = end - start
 
-    for i in tqdm(range(start, end + 1)):
+    if end <= start: return
+
+    self.progress.setValue(0)
+    self.progress.setFormat(f"Features: 0/{total}")
+    self.progress.setMaximum(total)
+
+    for i in range(start, end + 1):
       f = gray.get_frame(i)
       self.get_features(f, i)
+      self.progress.setValue(i - start)
+      self.progress.setFormat(f"Features: {i-start}/{total}")
 
     # feature matching
     index_params = dict(
@@ -194,15 +252,20 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
                                             ransacReprojThreshold=5.0)
       return M
 
-    print("transforms")
-    for i in tqdm(range(start, end)):
-      warp_matrices[i] = get_transform(i, i + 1)
+    self.progress.setValue(0)
+    self.progress.setFormat(f"Transforms: 0/{total}")
+    for i in range(start + 1, end + 1):
+      warp_matrices[i] = get_transform(i - 1, i)
+      self.progress.setValue(i - start)
+      self.progress.setFormat(f"Transforms: {i-start}/{total}")
 
     running_total_matrix = np.eye(3, 3, dtype=np.float64)
 
     sz = (node.height, node.width)
-    print("running total")
-    for i in tqdm(range(start, end)):
+
+    self.progress.setValue(0)
+    self.progress.setFormat(f"Cumulative: 0/{total}")
+    for i in range(start + 1, end + 1):
       wm = np.copy(warp_matrices[i])
 
       tempwarp = np.vstack([wm, np.array([0, 0, 1])])
@@ -240,11 +303,16 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
                             (int(sz[1] + right_padding - left_padding),
                              int(sz[0] + bottom_padding - top_padding)))
 
+      self.progress.setValue(i - start)
+    self.progress.setFormat(f"Cumulative: {i-start}/{total}")
+
     left = math.floor(round(min([o[0] for o in offsets.values()]), 4))
     top = math.floor(round(min([o[1] for o in offsets.values()]), 4))
     right = math.ceil(round(max([o[2] for o in offsets.values()]), 4))
     bottom = math.ceil(round(max([o[3] for o in offsets.values()]), 4))
 
+    self.transforms[start] = (np.array([[1, 0, 0], [0, 1, 0]],
+                                       dtype=np.float64), (1920, 1080))
     self.width = right - left
     self.height = bottom - top
 
@@ -252,6 +320,10 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
         o: (offsets[o][0] - left, offsets[o][1] - top)
         for o in offsets
     }
+
+    self.offsets_xy[start] = (-left, -top)
+
+    self.progress.setFormat(None)
 
     self.reset()
 
@@ -262,6 +334,10 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
                                       self.view.current_scene)
 
   def on_current_output_changed(self, cur, prev):
+    self.start_n.setMaximum(
+        self.main.current_output.prepared.original_clip.num_frames)
+    self.end_n.setMaximum(
+        self.main.current_output.prepared.original_clip.num_frames)
     self.on_current_frame_changed(self.main.current_output.last_showed_frame)
 
   def init_outputs(self) -> None:
