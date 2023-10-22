@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QWidget, QSizePolicy
+from PyQt6.QtWidgets import QWidget, QSizePolicy, QTableView
 from vspreview.core import Frame, PushButton, VBoxLayout, HBoxLayout, SpinBox, ProgressBar, LineEdit
-from vspreview.core.custom import ComboBox
+from vspreview.core.custom import ComboBox, TableModel
 from vspreview.plugins import MappedNodesPlugin, PluginConfig, PluginGraphicsView
 from vstools import vs
 
@@ -40,10 +40,17 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     self.progress = ProgressBar()
     self.progress.setTextVisible(True)
 
+    self.table_offsets = QTableView(None)
+    self.table_offsets.setModel(TableModel([], ["x", "y"], True))
+    self.table_offsets.setSizePolicy(QSizePolicy.Policy.Minimum,
+                                     QSizePolicy.Policy.Preferred)
+
     hbox = HBoxLayout(None,
                       [self.start_n, start_set, self.end_n, end_set, analyze])
     hbox2 = HBoxLayout(None, [self.outpath, self.rendermode, render])
-    VBoxLayout(self, [self.view, self.progress, hbox, hbox2])
+
+    hbox3 = HBoxLayout(None, [self.table_offsets, self.view])
+    VBoxLayout(self, [hbox3, self.progress, hbox, hbox2])
 
     self.features = {}
     self.transforms = {}
@@ -323,6 +330,11 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     self.offsets_xy[start] = (-left, -top)
 
+    data = [[f"{self.offsets_xy[i][0]:.8f}", f"{self.offsets_xy[i][1]:.8f}"]
+            for i in sorted(self.offsets_xy.keys())]
+
+    self.table_offsets.setModel(TableModel(data, ["x", "y"], True))
+
     self.progress.setFormat(None)
 
     self.reset()
@@ -332,6 +344,16 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
         self.main.current_output.to_time(frame))
     self.outputs.current.render_frame(frame, None, None,
                                       self.view.current_scene)
+
+    start = self.start_n.value()
+    row = frame - start
+    model = self.table_offsets.model()
+    if model == None:
+      return
+    if row >= 0 and row < model.rowCount(self.table_offsets):
+      self.table_offsets.selectRow(row)
+    else:
+      self.table_offsets.clearSelection()
 
   def on_current_output_changed(self, cur, prev):
     self.start_n.setMaximum(
