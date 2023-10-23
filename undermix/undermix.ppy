@@ -9,6 +9,7 @@ from vstools import vs
 
 from tqdm import tqdm
 import math
+import os
 import cv2
 import numpy as np
 from PIL import Image
@@ -83,6 +84,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     start = self.start_n.value()
     end = self.end_n.value()
     total = end - start
+    output_filename = self.outpath.text() or "stitched.png"
 
     rotated_images = {}
 
@@ -138,18 +140,22 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     self.update_progress(0, self.height, "Rendering")
 
-    def render(rotated_images, offsets_xy, width, height, up):
-      im = local.test(rotated_images, offsets_xy, width, height, up)
-      Image.fromarray(im.astype(np.uint8)).save("testall.png")
-      up(height)
+    def render(rotated_images, offsets_xy, width, height, update, path):
+      im = local.test(rotated_images, offsets_xy, width, height, update)
+      path2 = path
+      n = 1
+      while os.path.exists(path2):
+        a, b = os.path.splitext(path)
+        path2 = f"{a}{n}{b}"
+        n += 1
+
+      Image.fromarray(im.astype(np.uint8)).save(path2)
+      update(height)
 
     t = threading.Thread(target=render,
                          args=[
-                             rotated_images,
-                             offsets_xy,
-                             self.width,
-                             self.height,
-                             update_prog,
+                             rotated_images, offsets_xy, self.width,
+                             self.height, update_prog, output_filename
                          ],
                          daemon=True)
 
@@ -161,7 +167,6 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     self.progress.setMaximum(total)
     self.progress.setFormat(f"{text}: {c}/{total}")
     self.progress.update()
-    #print(f"{text}: {c}/{total}")
 
   def get_features(self, f, n):
     if n in self.features:
