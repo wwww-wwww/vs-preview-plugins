@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtWidgets import QWidget, QSizePolicy, QTableView
-from PyQt6.QtCore import pyqtSlot
+from PyQt6.QtCore import pyqtSlot, pyqtSignal
 from vspreview.core import Frame, PushButton, VBoxLayout, HBoxLayout, SpinBox, ProgressBar, LineEdit, CheckBox
 from vspreview.core.custom import ComboBox, TableModel
 from vspreview.plugins import MappedNodesPlugin, PluginConfig, PluginGraphicsView
@@ -27,6 +27,8 @@ __all__ = ["UndermixPlugin"]
 class UndermixPlugin(MappedNodesPlugin, QWidget):
   _config = PluginConfig("moe.grass", "Undermix")
 
+  progress_signal = pyqtSignal(int, int, str, bool)
+
   def setup_ui(self) -> None:
     self.view = PluginGraphicsView(self)
 
@@ -36,7 +38,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     end_set = PushButton("Set", self, clicked=self.set_end)
 
     self.start_n.setValue(0)
-    self.end_n.setValue(71)
+    self.end_n.setValue(100000)
 
     self.invert = CheckBox("Invert", checked=False)
 
@@ -56,6 +58,8 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     self.progress = ProgressBar()
     self.progress.setTextVisible(True)
+
+    self.progress_signal.connect(self.update_progress)
 
     self.table_offsets = QTableView(None)
     self.table_offsets.setModel(TableModel([], ["x", "y"], True))
@@ -100,7 +104,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     rotated_images = {}
 
-    self.update_progress(0, total, "Rotating frames")
+    self.progress_signal.emit(0, total, "Rotating frames", False)
 
     for i in range(start, end + 1):
       (warp_matrix, size) = self.transforms[i]
@@ -131,7 +135,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
       rotated_images[i] = im
 
-      self.update_progress(i - start, total, "Rotating frames")
+      self.progress_signal.emit(i - start, total, "Rotating frames", False)
 
     offsets_xy = [self.offsets_xy[k] for k in rotated_images]
     rotated_images = list(rotated_images.values())
@@ -142,12 +146,13 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     offsets_xy = np.array(offsets_xy, dtype=np.float64)
 
-    self.update_progress(0, self.height, "Rendering")
+    self.progress_signal.emit(0, self.height, "Rendering", False)
 
     def render(rotated_images, offsets_xy, width, height, path):
-      im = local.test(
-          rotated_images, offsets_xy, width, height,
-          lambda c: self.update_progress(c + 1, height, "Rendering"))
+      im = local.bilinear_median_bucket(
+          rotated_images, offsets_xy,
+          width, height, lambda c: self.progress_signal.emit(
+              c + 1, height, "Rendering", False))
       path2 = path
       n = 1
       while os.path.exists(path2):
@@ -155,9 +160,9 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
         path2 = f"{a}{n}{b}"
         n += 1
 
-      self.update_progress(height, height, "Saving")
+      self.progress_signal.emit(height, height, "Saving", False)
       Image.fromarray(im.astype(np.uint8)).save(path2)
-      self.update_progress(height, height, f"Saved as {path2}", True)
+      self.progress_signal.emit(height, height, f"Saved as {path2}", True)
 
     t = threading.Thread(target=render,
                          args=[
@@ -168,15 +173,14 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     t.start()
 
-  @pyqtSlot(int)
-  def update_progress(self, c, total, text, r=False):
+  @pyqtSlot(int, int, str, bool)
+  def update_progress(self, c, total, text, r):
     self.progress.setValue(c)
     self.progress.setMaximum(total)
     if r:
       self.progress.setFormat(text)
     else:
       self.progress.setFormat(f"{text}: {c}/{total}")
-    self.progress.update()
 
   def get_features(self, f, n):
     if n in self.features:
@@ -280,12 +284,12 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     if end <= start: return
 
-    self.update_progress(0, total, "Features")
+    self.progress_signal.emit(0, total, "Features", False)
 
     for i in range(start, end + 1):
       f = gray.get_frame(i)
       self.get_features(f, i)
-      self.update_progress(i - start, total, "Features")
+      self.progress_signal.emit(i - start, total, "Features", False)
 
     # feature matching
     index_params = dict(
@@ -352,13 +356,13 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
       return M
 
-    self.update_progress(0, total, "Transforms")
+    self.progress_signal.emit(0, total, "Transforms", False)
     for a, b in zip(range(start, end), range(start + 1, end + 1)):
       if self.invert.isChecked():
         warp_matrices[a] = get_transform(b, a)
       else:
         warp_matrices[b] = get_transform(a, b)
-      self.update_progress(b, total, "Transforms")
+      self.progress_signal.emit(b, total, "Transforms", False)
 
     running_total_matrix = np.eye(3, 3, dtype=np.float64)
 
@@ -372,7 +376,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
       self.transforms[start] = (running_total_matrix[:2], (node.width,
                                                            node.height))
 
-    self.update_progress(0, total, "Cumulative")
+    self.progress_signal.emit(0, total, "Cumulative", False)
     if self.invert.isChecked():
       a = start
       b = end
@@ -418,7 +422,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
                             (int(sz[1] + right_padding - left_padding),
                              int(sz[0] + bottom_padding - top_padding)))
 
-      self.update_progress(k, total, "Cumulative")
+      self.progress_signal.emit(k, total, "Cumulative", False)
 
     left = math.floor(min([o[0] for o in offsets.values()]))
     top = math.floor(min([o[1] for o in offsets.values()]))
