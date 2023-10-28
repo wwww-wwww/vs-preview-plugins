@@ -7,7 +7,6 @@ from vspreview.core.custom import ComboBox, TableModel
 from vspreview.plugins import MappedNodesPlugin, PluginConfig, PluginGraphicsView
 from vstools import vs
 
-from tqdm import tqdm
 import math
 import os
 import cv2
@@ -22,6 +21,11 @@ import threading
 core = vs.core
 
 __all__ = ["UndermixPlugin"]
+
+renderer = {
+    "median": local.bilinear_median_bucket,
+    "mean": local.bilinear_mean_bucket,
+}
 
 
 class UndermixPlugin(MappedNodesPlugin, QWidget):
@@ -52,7 +56,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     self.outpath.setSizePolicy(QSizePolicy.Policy.Preferred,
                                QSizePolicy.Policy.Maximum)
     self.rendermode = ComboBox()
-    self.rendermode.addItems(["median"])
+    self.rendermode.addItems(renderer.keys())
     self.rendermode.setCurrentIndex(0)
     render = PushButton("Render", self, clicked=self.render)
 
@@ -118,6 +122,19 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
       mask_im = np.ones(im.shape[:2], dtype=np.uint8)
       mask_im[:] = 255
 
+      feather_im = np.ones(im.shape[:2], dtype=np.float64)
+
+      xd = feather_im.shape[0] // 8
+      yd = feather_im.shape[1] // 8
+
+      for x in range(xd):
+        feather_im[x, :] = x / xd
+        feather_im[-x, :] = x / xd
+
+      for y in range(yd):
+        feather_im[:, y] *= y / yd
+        feather_im[:, -y] *= y / yd
+
       im = cv2.warpAffine(im,
                           warp_matrix,
                           size,
@@ -131,8 +148,15 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
                             borderMode=cv2.BORDER_CONSTANT,
                             borderValue=0).astype(np.float64)
 
-      im[:, :, 3] = mask
+      feather_im = cv2.warpAffine(feather_im,
+                                  warp_matrix,
+                                  size,
+                                  flags=cv2.INTER_CUBIC + cv2.WARP_INVERSE_MAP,
+                                  borderMode=cv2.BORDER_CONSTANT,
+                                  borderValue=0).astype(np.float64)
 
+      im[:, :, 3] = mask
+      im = np.dstack([im, feather_im])
       rotated_images[i] = im
 
       self.progress_signal.emit(i - start, total, "Rotating frames", False)
@@ -148,8 +172,8 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     self.progress_signal.emit(0, self.height, "Rendering", False)
 
-    def render(rotated_images, offsets_xy, width, height, path):
-      im = local.bilinear_median_bucket(
+    def render(rendermode, rotated_images, offsets_xy, width, height, path):
+      im = list(renderer.values())[rendermode](
           rotated_images, offsets_xy,
           width, height, lambda c: self.progress_signal.emit(
               c + 1, height, "Rendering", False))
@@ -166,8 +190,8 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     t = threading.Thread(target=render,
                          args=[
-                             rotated_images, offsets_xy, self.width,
-                             self.height, output_filename
+                             rendermode, rotated_images, offsets_xy,
+                             self.width, self.height, output_filename
                          ],
                          daemon=True)
 
@@ -266,6 +290,20 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
                                 selector=rotate)
 
     return node
+
+  def analyze2(self):
+    node = self.main.current_output.prepared.original_clip
+
+    gray = core.resize.Bicubic(node, format=vs.GRAY8, matrix_s="709")
+    gray = core.std.RemoveFrameProps(gray, "_Matrix")
+    gray = core.std.Sobel(gray)
+
+    finder = cv.ORB.create()
+
+    match_conf = 0.3
+    matcher = cv2.detail_AffineBestOf2NearestMatcher(False, True, match_conf)
+
+    estimator = cv2.detail_AffineBasedEstimator()
 
   def analyze(self):
     node = self.main.current_output.prepared.original_clip
