@@ -27,6 +27,60 @@ renderer = {
     "mean": local.bilinear_mean_bucket,
 }
 
+stitchmodes = [
+    "Local features affine",
+    "Local ECC translation",
+    "Global features stitcher",
+]
+
+# feature matching
+index_params = dict(
+    algorithm=6,
+    table_number=6,  # 12
+    key_size=12,  # 20
+    multi_probe_level=1)
+search_params = dict(checks=50)
+flann = cv2.FlannBasedMatcher(index_params, search_params)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+number_of_iterations = 400
+termination_eps = 1e-6
+criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+            number_of_iterations, termination_eps)
+
+
+def feature_matching(cache, i1, i2):
+  kp1, des1 = cache[i1]
+  kp2, des2 = cache[i2]
+
+  matches2to1 = flann.knnMatch(des2, des1, k=2)
+  recip_matches = flann.knnMatch(des1, des2, k=2)
+
+  matchesMask_ratio = [[0, 0] for i in range(len(matches2to1))]
+  match_dict = {}
+  for i, d in enumerate(matches2to1):
+    if len(d) < 2: continue
+    m, n = d
+
+    if m.distance < 0.7 * n.distance:
+      matchesMask_ratio[i] = [1, 0]
+      match_dict[m.trainIdx] = m.queryIdx
+
+  good = []
+  matchesMask_ratio_recip = [[0, 0] for i in range(len(recip_matches))]
+
+  for i, d in enumerate(recip_matches):
+    if len(d) < 2: continue
+    m, n = d
+    if m.distance < 0.7 * n.distance:  # ratio
+      if m.queryIdx in match_dict and match_dict[
+          m.queryIdx] == m.trainIdx:  #reciprocal
+        good.append(m)
+        matchesMask_ratio_recip[i] = [1, 0]
+
+  return ([kp1[m.queryIdx].pt
+           for m in good], [kp2[m.trainIdx].pt for m in good])
+
 
 class UndermixPlugin(MappedNodesPlugin, QWidget):
   _config = PluginConfig("moe.grass", "Undermix")
@@ -46,15 +100,28 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     self.invert = CheckBox("Invert", checked=False)
 
-    self.allow_vertical = CheckBox("Vertical", checked=True)
-    self.allow_horizontal = CheckBox("Horizontal", checked=True)
-    self.allow_rotation = CheckBox("Rotation", checked=True)
+    self.stitchmode = ComboBox()
+    self.stitchmode.addItems(stitchmodes)
+    self.stitchmode.setCurrentIndex(0)
 
     analyze = PushButton("Analyze", self, clicked=self.analyze)
+
+    self.stitchmask = LineEdit("stitchmask.png")
+    self.stitchmask.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                  QSizePolicy.Policy.Maximum)
+
+    self.stitchmask_invert = CheckBox("Invert", checked=False)
+
+    self.rendermask = LineEdit("rendermask.png")
+    self.rendermask.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                  QSizePolicy.Policy.Maximum)
+
+    self.rendermask_invert = CheckBox("Invert", checked=False)
 
     self.outpath = LineEdit("stitched.png")
     self.outpath.setSizePolicy(QSizePolicy.Policy.Preferred,
                                QSizePolicy.Policy.Maximum)
+
     self.rendermode = ComboBox()
     self.rendermode.addItems(renderer.keys())
     self.rendermode.setCurrentIndex(0)
@@ -73,12 +140,13 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     hbox1 = HBoxLayout(
         None, [self.start_n, start_set, self.end_n, end_set, self.invert])
     hbox2 = HBoxLayout(None, [
-        self.allow_vertical, self.allow_horizontal, self.allow_rotation,
-        analyze
+        self.stitchmask, self.stitchmask_invert, self.rendermask,
+        self.rendermask_invert
     ])
-    hbox3 = HBoxLayout(None, [self.outpath, self.rendermode, render])
+    hbox3 = HBoxLayout(None, [self.stitchmode, analyze])
+    hbox4 = HBoxLayout(None, [self.outpath, self.rendermode, render])
 
-    vbox = VBoxLayout(None, [self.table_offsets, hbox1, hbox2, hbox3])
+    vbox = VBoxLayout(None, [self.table_offsets, hbox1, hbox2, hbox3, hbox4])
 
     hbox3 = HBoxLayout(None, [vbox, self.view])
     VBoxLayout(self, [hbox3, self.progress])
@@ -88,6 +156,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     self.offsets_xy = {}
     self.width = None
     self.height = None
+    self.with_mask = False
 
   def set_start(self):
     self.start_n.setValue(self.main.current_output.last_showed_frame)
@@ -115,7 +184,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
       frame = node.get_frame(i)
 
       im = np.ctypeslib.as_array(frame).swapaxes(0, 2).swapaxes(0, 1)
-      im = im.copy(order="C")
+
       im = im.reshape((node.height, node.width, 3))
       im = cv2.cvtColor(im, cv2.COLOR_RGB2RGBA)
 
@@ -206,26 +275,57 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     else:
       self.progress.setFormat(f"{text}: {c}/{total}")
 
-  def get_features(self, f, n):
+  def get_mask(self, mask, n):
+    if mask is None or n not in self.transforms: return None
+
+    warp_matrix = self.transforms[n][0]
+
+    warp_matrix = np.vstack([warp_matrix, [0, 0, 1]])
+    warp_matrix = np.linalg.inv(warp_matrix)[:2]
+
+    warp_matrix = np.vstack([warp_matrix, [0, 0, 1]])
+    trans = np.eye(3, dtype=np.float64)
+    trans[0, 2] = self.offsets_xy[n][0]
+    trans[1, 2] = self.offsets_xy[n][1]
+    warp_matrix = warp_matrix.dot(trans)[:2]
+
+    return cv2.warpAffine(mask,
+                          warp_matrix, (1920, 1080),
+                          flags=cv2.INTER_CUBIC + cv2.WARP_INVERSE_MAP,
+                          borderMode=cv2.BORDER_CONSTANT).astype(np.uint8)
+
+  def get_features(self, f, n, mask=None):
     if n in self.features:
       return self.features[n]
     orb = cv2.ORB_create(1000)
-    gray = np.ctypeslib.as_array(f).reshape((1080, 1920)).copy(order="C")
-    self.features[n] = orb.detectAndCompute(gray, None)
+    gray = np.ctypeslib.as_array(f).reshape((1080, 1920))
+    self.features[n] = orb.detectAndCompute(gray, mask)
     return self.features[n]
+
+  def get_stitchmask(self):
+    if not os.path.exists(self.stitchmask.text() or "stitchmask.png"):
+      return None
+
+    stitchmask = Image.open(self.stitchmask.text() or "stitchmask.png")
+    stitchmask = stitchmask.convert(mode="L")
+    stitchmask = np.array(stitchmask).astype(np.uint8)
+
+    if self.stitchmask_invert.isChecked():
+      stitchmask = 255 - stitchmask
+
+    return stitchmask
 
   def get_node(self, node):
     if node.format.id == vs.GRAY32: return node
 
-    gray = core.resize.Bicubic(node, format=vs.GRAY8, matrix_s="709")
-    gray = core.std.RemoveFrameProps(gray, "_Matrix")
-    gray = core.std.Sobel(gray)
+    if self.width == None: return node
+
+    stitchmask = self.get_stitchmask()
 
     def points(n, f):
       im = np.ctypeslib.asarray(f[0]).swapaxes(0, 2).swapaxes(0, 1)
-      im = im.copy(order="C")
 
-      kp, des = self.get_features(f[1], n)
+      kp, des = self.get_features(f[1], n, stitchmask)
       im = cv2.drawKeypoints(im, kp, None, color=(255, 0, 0), flags=0)
 
       f = f[0].copy()
@@ -236,7 +336,11 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     node = core.resize.Bicubic(node, format=vs.RGB24, matrix_in_s="709")
 
-    if self.width == None:
+    if self.width == None and self.stitchmode.currentIndex() == 0:
+      gray = core.resize.Bicubic(node, format=vs.GRAY8, matrix_s="709")
+      gray = core.std.RemoveFrameProps(gray, "_Matrix")
+      gray = core.std.Sobel(gray)
+
       node = core.std.ModifyFrame(clips=[node, gray],
                                   clip=node,
                                   selector=points)
@@ -245,14 +349,14 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     resized = core.resize.Bicubic(node, width=self.width, height=self.height)
 
     def rotate(n, f):
-      if n not in self.transforms or n not in self.offsets_xy or n not in self.features:
+      if n not in self.transforms or n not in self.offsets_xy:
         return f[1]
 
       im = np.ctypeslib.asarray(f[0]).swapaxes(0, 2).swapaxes(0, 1)
-      im = im.copy(order="C")
 
-      kp, des = self.features[n]
-      im = cv2.drawKeypoints(im, kp, None, color=(255, 0, 0), flags=0)
+      if self.stitchmode.currentIndex() == 0 and n in self.features:
+        kp, _ = self.features[n]
+        im = cv2.drawKeypoints(im, kp, None, color=(255, 0, 0), flags=0)
 
       (warp_matrix, size) = self.transforms[n]
 
@@ -289,6 +393,31 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
                                 clip=resized,
                                 selector=rotate)
 
+    def withmask(n, f):
+      im = np.ctypeslib.asarray(f[1]).swapaxes(0, 2).swapaxes(0, 1)
+      im0 = np.ctypeslib.asarray(f[0]).swapaxes(0, 2).swapaxes(0, 1)
+      im[0:im0.shape[0], 0:im0.shape[1], :] = im0
+
+      mask = self.get_mask(stitchmask, n)
+      if mask is not None:
+        im[0:1080, im0.shape[1]:im0.shape[1] + 1920, 0] = mask
+        im[0:1080, im0.shape[1]:im0.shape[1] + 1920, 1] = mask
+        im[0:1080, im0.shape[1]:im0.shape[1] + 1920, 2] = mask
+
+        f = f[1].copy()
+        np.copyto(np.asarray(f[0]), im[:, :, 0])
+        np.copyto(np.asarray(f[1]), im[:, :, 1])
+        np.copyto(np.asarray(f[2]), im[:, :, 2])
+        return f
+
+      return f[1]
+
+    resized = core.std.BlankClip(resized, width=int(resized.width * 2))
+
+    node = core.std.ModifyFrame(clips=[node, resized],
+                                clip=resized,
+                                selector=withmask)
+
     return node
 
   def analyze2(self):
@@ -306,6 +435,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     estimator = cv2.detail_AffineBasedEstimator()
 
   def analyze(self):
+    self.features.clear()
     node = self.main.current_output.prepared.original_clip
 
     gray = core.resize.Bicubic(node, format=vs.GRAY8, matrix_s="709")
@@ -322,57 +452,34 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     if end <= start: return
 
-    self.progress_signal.emit(0, total, "Features", False)
-
-    for i in range(start, end + 1):
-      f = gray.get_frame(i)
-      self.get_features(f, i)
-      self.progress_signal.emit(i - start, total, "Features", False)
-
-    # feature matching
-    index_params = dict(
-        algorithm=6,
-        table_number=6,  # 12
-        key_size=12,  # 20
-        multi_probe_level=1)
-    search_params = dict(checks=50)
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-
-    def feature_matching(i1, i2):
-      kp1, des1 = self.features[i1]
-      kp2, des2 = self.features[i2]
-
-      matches2to1 = flann.knnMatch(des2, des1, k=2)
-      recip_matches = flann.knnMatch(des1, des2, k=2)
-
-      matchesMask_ratio = [[0, 0] for i in range(len(matches2to1))]
-      match_dict = {}
-      for i, d in enumerate(matches2to1):
-        if len(d) < 2: continue
-        m, n = d
-
-        if m.distance < 0.7 * n.distance:
-          matchesMask_ratio[i] = [1, 0]
-          match_dict[m.trainIdx] = m.queryIdx
-
-      good = []
-      matchesMask_ratio_recip = [[0, 0] for i in range(len(recip_matches))]
-
-      for i, d in enumerate(recip_matches):
-        if len(d) < 2: continue
-        m, n = d
-        if m.distance < 0.7 * n.distance:  # ratio
-          if m.queryIdx in match_dict and match_dict[
-              m.queryIdx] == m.trainIdx:  #reciprocal
-            good.append(m)
-            matchesMask_ratio_recip[i] = [1, 0]
-
-      return ([kp1[m.queryIdx].pt
-               for m in good], [kp2[m.trainIdx].pt for m in good])
+    stitchmask = None
+    if self.transforms and not self.with_mask:
+      stitchmask = self.get_stitchmask()
 
     def get_transform(i1, i2):
-      pts1, pts2 = feature_matching(i1, i2)
+      if self.stitchmode.currentIndex() == 1:
+        im1 = np.ctypeslib.as_array(gray.get_frame(i1)).reshape((1080, 1920))
+        im2 = np.ctypeslib.as_array(gray.get_frame(i2)).reshape((1080, 1920))
+        (cc, M) = cv2.findTransformECC(im1, im2, np.eye(2, 3,
+                                                        dtype=np.float32),
+                                       cv2.MOTION_TRANSLATION, criteria, None)
+        # TODO: stitchmask
+        return M
+
+      mask1 = self.get_mask(stitchmask, i1)
+      mask2 = self.get_mask(stitchmask, i2)
+
+      if mask1 is not None and mask2 is not None:
+        self.with_mask = True
+      else:
+        mask1 = None
+        mask2 = None
+        self.with_mask = False
+
+      self.get_features(gray.get_frame(i1), i1, mask1)
+      self.get_features(gray.get_frame(i2), i2, mask2)
+
+      pts1, pts2 = feature_matching(self.features, i1, i2)
 
       src_pts = np.float32(pts1).reshape(-1, 1, 2)
       dst_pts = np.float32(pts2).reshape(-1, 1, 2)
@@ -381,16 +488,6 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
                                             dst_pts,
                                             cv2.USAC_MAGSAC,
                                             ransacReprojThreshold=5.0)
-
-      if not self.allow_rotation.isChecked():
-        M[0, 0] = 1
-        M[0, 1] = 0
-        M[1, 0] = 0
-        M[1, 1] = 1
-      if not self.allow_vertical.isChecked():
-        M[1, 2] = 0
-      if not self.allow_horizontal.isChecked():
-        M[0, 2] = 0
 
       return M
 
@@ -415,6 +512,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
                                                            node.height))
 
     self.progress_signal.emit(0, total, "Cumulative", False)
+
     if self.invert.isChecked():
       a = start
       b = end
@@ -423,14 +521,15 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
       a = start + 1
       b = end + 1
       c = 1
+
     for k, i in enumerate(range(a, b)[::c], 1):
       wm = np.copy(warp_matrices[i])
 
-      tempwarp = np.vstack([wm, np.array([0, 0, 1])])
+      tempwarp = np.vstack([wm, [0, 0, 1]])
       running_total_matrix = tempwarp.dot(running_total_matrix)
 
       warp_matrix = running_total_matrix[:2].astype(np.float64)
-      c = np.vstack((warp_matrix, [0, 0, 1]))
+      c = np.vstack([warp_matrix, [0, 0, 1]])
       c_inv = np.linalg.inv(c)[:2]
 
       points = [[0, 0], [sz[1], 0], [0, sz[0]], [sz[1], sz[0]]]
@@ -451,7 +550,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
       offset_trans = np.eye(3, 3, dtype=np.float64)
       offset_trans[0, 2] = left_padding
       offset_trans[1, 2] = top_padding
-      new_warp_matrix = np.vstack([warp_matrix, np.array([0, 0, 1])])
+      new_warp_matrix = np.vstack([warp_matrix, [0, 0, 1]])
 
       new_warp_matrix = new_warp_matrix.dot(offset_trans)[:2]
 
