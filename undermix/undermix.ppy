@@ -97,13 +97,13 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     self.chk_align_inv = CheckBox("Invert", checked=False)
 
-    self.stitchmode = ComboBox()
-    self.stitchmode.addItems(stitchmodes)
-    self.stitchmode.setCurrentIndex(0)
-    self.stitchmode.setSizePolicy(QSizePolicy.Policy.Preferred,
-                                  QSizePolicy.Policy.Maximum)
+    self.cmb_align_mode = ComboBox()
+    self.cmb_align_mode.addItems(stitchmodes)
+    self.cmb_align_mode.setCurrentIndex(0)
 
-    btn_analyze = PushButton("Analyze", self, clicked=self.analyze)
+    btn_align = PushButton("Align", self, clicked=self.analyze)
+    btn_align.setSizePolicy(QSizePolicy.Policy.Maximum,
+                            QSizePolicy.Policy.Maximum)
 
     self.chk_align_mask = CheckBox("Align mask", checked=False)
     self.txt_align_mask = LineEdit("alignmask.png")
@@ -127,6 +127,8 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     self.rendermode.addItems(renderer.keys())
     self.rendermode.setCurrentIndex(0)
     btn_render = PushButton("Render", self, clicked=self.render)
+    btn_render.setSizePolicy(QSizePolicy.Policy.Maximum,
+                             QSizePolicy.Policy.Maximum)
 
     self.progress = ProgressBar()
     self.progress.setTextVisible(True)
@@ -142,7 +144,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
         [self.start_n, start_set, self.end_n, end_set, self.chk_align_inv],
         [self.chk_align_mask, self.txt_align_mask, self.chk_align_mask_inv],
         [self.chk_render_mask, self.txt_render_mask, self.chk_render_mask_inv],
-        [self.stitchmode, btn_analyze],
+        [self.cmb_align_mode, btn_align],
         [self.outpath, self.rendermode, btn_render],
     ]
     rows = [HBoxLayout(None, row) for row in rows]
@@ -355,7 +357,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     node = core.resize.Bicubic(node, format=vs.RGB24, matrix_in_s="709")
 
-    if self.width == None and self.stitchmode.currentIndex() == 0:
+    if self.width == None and self.cmb_align_mode.currentIndex() == 0:
       gray = core.resize.Bicubic(node, format=vs.GRAY8, matrix_s="709")
       gray = core.std.RemoveFrameProps(gray, "_Matrix")
       gray = core.std.Sobel(gray)
@@ -373,7 +375,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
       im = np.ctypeslib.asarray(f[0]).swapaxes(0, 2).swapaxes(0, 1)
 
-      if self.stitchmode.currentIndex() == 0 and n in self.features:
+      if self.cmb_align_mode.currentIndex() == 0 and n in self.features:
         kp, _ = self.features[n]
         im = cv2.drawKeypoints(im, kp, None, color=(255, 0, 0), flags=0)
 
@@ -484,7 +486,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
       alignmask = self.get_alignmask(alignmask_invert)
 
     def get_transform(i1, i2):
-      if self.stitchmode.currentIndex() == 1:
+      if self.cmb_align_mode.currentIndex() == 1:
         im1 = np.ctypeslib.as_array(gray.get_frame(i1)).reshape((1080, 1920))
         im2 = np.ctypeslib.as_array(gray.get_frame(i2)).reshape((1080, 1920))
         (cc, M) = cv2.findTransformECC(im1, im2, np.eye(2, 3,
