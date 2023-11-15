@@ -381,32 +381,21 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
       (warp_matrix, size) = self.transforms[n]
 
+      warp_matrix = np.vstack([warp_matrix, [0, 0, 1]])
+      trans = np.eye(3, dtype=np.float64)
+      trans[0, 2] = -self.offsets_xy[n][0]
+      trans[1, 2] = -self.offsets_xy[n][1]
+      warp_matrix = warp_matrix.dot(trans)[:2]
+
       im = cv2.warpAffine(im,
-                          warp_matrix,
-                          size,
+                          warp_matrix, (f[1].width, f[1].height),
                           flags=cv2.INTER_CUBIC + cv2.WARP_INVERSE_MAP,
                           borderMode=cv2.BORDER_CONSTANT).astype(np.uint8)
 
-      im2 = np.zeros((f[1].height, f[1].width, 3), np.uint8)
-
-      x, y = self.offsets_xy[n]
-
-      x = int(round(x))
-      y = int(round(y))
-      x2 = x + im.shape[1]
-      y2 = y + im.shape[0]
-
-      x = max(x, 0)
-      y = max(y, 0)
-      x2 = min(x2, f[1].width)
-      y2 = min(y2, f[1].height)
-
-      im2[y:y2, x:x2] = im[:y2 - y, :x2 - x]
-
       f = f[1].copy()
-      np.copyto(np.asarray(f[0]), im2[:, :, 0])
-      np.copyto(np.asarray(f[1]), im2[:, :, 1])
-      np.copyto(np.asarray(f[2]), im2[:, :, 2])
+      np.copyto(np.asarray(f[0]), im[:, :, 0])
+      np.copyto(np.asarray(f[1]), im[:, :, 1])
+      np.copyto(np.asarray(f[2]), im[:, :, 2])
       return f
 
     resized = core.std.BlankClip(resized)
