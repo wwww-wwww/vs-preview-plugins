@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from PyQt6.QtWidgets import QWidget, QSizePolicy, QTableView
 from PyQt6.QtCore import pyqtSlot, pyqtSignal
 from vspreview.core import Frame, PushButton, VBoxLayout, HBoxLayout, SpinBox, ProgressBar, LineEdit, CheckBox
@@ -11,12 +9,12 @@ import math
 import os
 import cv2
 import numpy as np
+import threading
 from PIL import Image
 
-np.set_printoptions(suppress=True)
 import local
 
-import threading
+np.set_printoptions(suppress=True)
 
 core = vs.core
 
@@ -41,7 +39,6 @@ index_params = dict(
     multi_probe_level=1)
 search_params = dict(checks=50)
 flann = cv2.FlannBasedMatcher(index_params, search_params)
-bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
 number_of_iterations = 400
 termination_eps = 1e-6
@@ -98,25 +95,29 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     self.start_n.setValue(0)
     self.end_n.setValue(100000)
 
-    self.invert = CheckBox("Invert", checked=False)
+    self.chk_align_inv = CheckBox("Invert", checked=False)
 
     self.stitchmode = ComboBox()
     self.stitchmode.addItems(stitchmodes)
     self.stitchmode.setCurrentIndex(0)
-
-    analyze = PushButton("Analyze", self, clicked=self.analyze)
-
-    self.stitchmask = LineEdit("stitchmask.png")
-    self.stitchmask.setSizePolicy(QSizePolicy.Policy.Preferred,
+    self.stitchmode.setSizePolicy(QSizePolicy.Policy.Preferred,
                                   QSizePolicy.Policy.Maximum)
 
-    self.stitchmask_invert = CheckBox("Invert", checked=False)
+    btn_analyze = PushButton("Analyze", self, clicked=self.analyze)
 
-    self.rendermask = LineEdit("rendermask.png")
-    self.rendermask.setSizePolicy(QSizePolicy.Policy.Preferred,
-                                  QSizePolicy.Policy.Maximum)
+    self.chk_align_mask = CheckBox("Align mask", checked=False)
+    self.txt_align_mask = LineEdit("alignmask.png")
+    self.txt_align_mask.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                      QSizePolicy.Policy.Maximum)
 
-    self.rendermask_invert = CheckBox("Invert", checked=False)
+    self.chk_align_mask_inv = CheckBox("Invert", checked=False)
+
+    self.chk_render_mask = CheckBox("Render mask", checked=False)
+    self.txt_render_mask = LineEdit("rendermask.png")
+    self.txt_render_mask.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                       QSizePolicy.Policy.Maximum)
+
+    self.chk_render_mask_inv = CheckBox("Invert", checked=False)
 
     self.outpath = LineEdit("stitched.png")
     self.outpath.setSizePolicy(QSizePolicy.Policy.Preferred,
@@ -125,7 +126,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     self.rendermode = ComboBox()
     self.rendermode.addItems(renderer.keys())
     self.rendermode.setCurrentIndex(0)
-    render = PushButton("Render", self, clicked=self.render)
+    btn_render = PushButton("Render", self, clicked=self.render)
 
     self.progress = ProgressBar()
     self.progress.setTextVisible(True)
@@ -137,26 +138,30 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     self.table_offsets.setSizePolicy(QSizePolicy.Policy.Minimum,
                                      QSizePolicy.Policy.Preferred)
 
-    hbox1 = HBoxLayout(
-        None, [self.start_n, start_set, self.end_n, end_set, self.invert])
-    hbox2 = HBoxLayout(None, [
-        self.stitchmask, self.stitchmask_invert, self.rendermask,
-        self.rendermask_invert
-    ])
-    hbox3 = HBoxLayout(None, [self.stitchmode, analyze])
-    hbox4 = HBoxLayout(None, [self.outpath, self.rendermode, render])
+    rows = [
+        [self.start_n, start_set, self.end_n, end_set, self.chk_align_inv],
+        [self.chk_align_mask, self.txt_align_mask, self.chk_align_mask_inv],
+        [self.chk_render_mask, self.txt_render_mask, self.chk_render_mask_inv],
+        [self.stitchmode, btn_analyze],
+        [self.outpath, self.rendermode, btn_render],
+    ]
+    rows = [HBoxLayout(None, row) for row in rows]
 
-    vbox = VBoxLayout(None, [self.table_offsets, hbox1, hbox2, hbox3, hbox4])
+    left = VBoxLayout(None, [self.table_offsets] + rows)
+    main = HBoxLayout(None, [left, self.view])
+    VBoxLayout(self, [main, self.progress])
 
-    hbox3 = HBoxLayout(None, [vbox, self.view])
-    VBoxLayout(self, [hbox3, self.progress])
-
+    self.align_start = None
+    self.align_end = None
+    self.align_output = None
+    self.align_invert = False
+    self.align_mask = False
+    self.align_mask_invert = False
     self.features = {}
     self.transforms = {}
     self.offsets_xy = {}
     self.width = None
     self.height = None
-    self.with_mask = False
 
   def set_start(self):
     self.start_n.setValue(self.main.current_output.last_showed_frame)
@@ -165,13 +170,16 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     self.end_n.setValue(self.main.current_output.last_showed_frame)
 
   def render(self):
-    self.analyze()
+    start = self.start_n.value()
+    end = self.end_n.value()
+
+    while self.changed():
+      self.analyze()
+
     node = self.main.current_output.prepared.original_clip
     node = core.resize.Point(node, format=vs.RGB24)
 
     rendermode = self.rendermode.currentIndex()
-    start = self.start_n.value()
-    end = self.end_n.value()
     total = end - start
     output_filename = self.outpath.text() or "stitched.png"
 
@@ -233,7 +241,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     offsets_xy = [self.offsets_xy[k] for k in rotated_images]
     rotated_images = list(rotated_images.values())
 
-    if self.invert.isChecked():
+    if self.chk_align_inv.isChecked():
       rotated_images.reverse()
       offsets_xy.reverse()
 
@@ -302,30 +310,41 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     self.features[n] = orb.detectAndCompute(gray, mask)
     return self.features[n]
 
-  def get_stitchmask(self):
-    if not os.path.exists(self.stitchmask.text() or "stitchmask.png"):
-      return None
+  def path_alignmask(self):
+    return self.txt_align_mask.text() or "alignmask.png"
 
-    stitchmask = Image.open(self.stitchmask.text() or "stitchmask.png")
-    stitchmask = stitchmask.convert(mode="L")
-    stitchmask = np.array(stitchmask).astype(np.uint8)
+  def have_alignmask(self):
+    if not self.chk_align_mask.isChecked():
+      return False
 
-    if self.stitchmask_invert.isChecked():
-      stitchmask = 255 - stitchmask
+    if not os.path.exists(self.path_alignmask()):
+      print("can't find", self.path_alignmask())
+      return False
 
-    return stitchmask
+    return True
+
+  def get_alignmask(self, inv):
+    if not self.have_alignmask(): return None
+
+    alignmask = Image.open(self.path_alignmask())
+    alignmask = alignmask.convert(mode="L")
+    alignmask = np.array(alignmask).astype(np.uint8)
+
+    if inv: alignmask = 255 - alignmask
+
+    return alignmask
 
   def get_node(self, node):
     if node.format.id == vs.GRAY32: return node
 
     if self.width == None: return node
 
-    stitchmask = self.get_stitchmask()
+    alignmask = self.get_alignmask(self.align_mask_invert)
 
     def points(n, f):
       im = np.ctypeslib.asarray(f[0]).swapaxes(0, 2).swapaxes(0, 1)
 
-      kp, des = self.get_features(f[1], n, stitchmask)
+      kp, des = self.get_features(f[1], n, alignmask)
       im = cv2.drawKeypoints(im, kp, None, color=(255, 0, 0), flags=0)
 
       f = f[0].copy()
@@ -393,12 +412,14 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
                                 clip=resized,
                                 selector=rotate)
 
+    if not self.align_mask: return node
+
     def withmask(n, f):
       im = np.ctypeslib.asarray(f[1]).swapaxes(0, 2).swapaxes(0, 1)
       im0 = np.ctypeslib.asarray(f[0]).swapaxes(0, 2).swapaxes(0, 1)
       im[0:im0.shape[0], 0:im0.shape[1], :] = im0
 
-      mask = self.get_mask(stitchmask, n)
+      mask = self.get_mask(alignmask, n)
       if mask is not None:
         im[0:1080, im0.shape[1]:im0.shape[1] + 1920, 0] = mask
         im[0:1080, im0.shape[1]:im0.shape[1] + 1920, 1] = mask
@@ -420,21 +441,26 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     return node
 
-  def analyze2(self):
-    node = self.main.current_output.prepared.original_clip
+  def changed(self):
+    if self.align_start != self.start_n.value(): return True
+    if self.align_end != self.end_n.value(): return True
 
-    gray = core.resize.Bicubic(node, format=vs.GRAY8, matrix_s="709")
-    gray = core.std.RemoveFrameProps(gray, "_Matrix")
-    gray = core.std.Sobel(gray)
+    if self.align_invert != self.chk_align_inv.isChecked(): return True
 
-    finder = cv.ORB.create()
+    if self.have_alignmask():
+      if not self.align_mask: return True
+      if self.align_mask_invert != self.chk_align_mask_inv.isChecked():
+        return True
+    else:
+      if self.align_mask: return True
 
-    match_conf = 0.3
-    matcher = cv2.detail_AffineBestOf2NearestMatcher(False, True, match_conf)
+    # TODO: align_output
 
-    estimator = cv2.detail_AffineBasedEstimator()
+    return False
 
   def analyze(self):
+    if not self.changed(): return
+
     self.features.clear()
     node = self.main.current_output.prepared.original_clip
 
@@ -452,9 +478,10 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     if end <= start: return
 
-    stitchmask = None
-    if self.transforms and not self.with_mask:
-      stitchmask = self.get_stitchmask()
+    alignmask = None
+    alignmask_invert = self.chk_align_mask_inv.isChecked()
+    if self.align_start == start and self.align_end == end and not self.align_mask:
+      alignmask = self.get_alignmask(alignmask_invert)
 
     def get_transform(i1, i2):
       if self.stitchmode.currentIndex() == 1:
@@ -463,18 +490,18 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
         (cc, M) = cv2.findTransformECC(im1, im2, np.eye(2, 3,
                                                         dtype=np.float32),
                                        cv2.MOTION_TRANSLATION, criteria, None)
-        # TODO: stitchmask
+        # TODO: alignmask
         return M
 
-      mask1 = self.get_mask(stitchmask, i1)
-      mask2 = self.get_mask(stitchmask, i2)
+      mask1 = self.get_mask(alignmask, i1)
+      mask2 = self.get_mask(alignmask, i2)
 
       if mask1 is not None and mask2 is not None:
-        self.with_mask = True
+        self.align_mask = True
       else:
         mask1 = None
         mask2 = None
-        self.with_mask = False
+        self.align_mask = False
 
       self.get_features(gray.get_frame(i1), i1, mask1)
       self.get_features(gray.get_frame(i2), i2, mask2)
@@ -493,7 +520,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     self.progress_signal.emit(0, total, "Transforms", False)
     for a, b in zip(range(start, end), range(start + 1, end + 1)):
-      if self.invert.isChecked():
+      if self.chk_align_inv.isChecked():
         warp_matrices[a] = get_transform(b, a)
       else:
         warp_matrices[b] = get_transform(a, b)
@@ -502,7 +529,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
     running_total_matrix = np.eye(3, 3, dtype=np.float64)
 
     sz = (node.height, node.width)
-    if self.invert.isChecked():
+    if self.chk_align_inv.isChecked():
       offsets[end] = (0, 0, node.width, node.height)
       self.transforms[end] = (running_total_matrix[:2], (node.width,
                                                          node.height))
@@ -513,7 +540,7 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     self.progress_signal.emit(0, total, "Cumulative", False)
 
-    if self.invert.isChecked():
+    if self.chk_align_inv.isChecked():
       a = start
       b = end
       c = -1
@@ -581,6 +608,10 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
 
     self.progress.setFormat(None)
 
+    self.align_start = start
+    self.align_end = end
+    self.align_mask_invert = alignmask_invert
+
     self.reset()
 
   def on_current_frame_changed(self, frame: Frame) -> None:
@@ -600,11 +631,6 @@ class UndermixPlugin(MappedNodesPlugin, QWidget):
       self.table_offsets.clearSelection()
 
   def on_current_output_changed(self, cur, prev):
-    self.features.clear()
-    self.offsets_xy.clear()
-    self.transforms.clear()
-    self.width = None
-    self.height = None
     self.start_n.setMaximum(
         self.main.current_output.prepared.original_clip.num_frames - 1)
     self.end_n.setMaximum(
